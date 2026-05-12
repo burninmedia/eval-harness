@@ -15,8 +15,8 @@ cd "$APP_ROOT"
 CONV_PASS=0
 CONV_FAIL=0
 
-check_pass() { echo "[PASS] $1"; ((CONV_PASS++)); }
-check_fail() { echo "[FAIL] $1"; ((CONV_FAIL++)); }
+check_pass() { echo "[PASS] $1"; CONV_PASS=$((CONV_PASS+1)); }
+check_fail() { echo "[FAIL] $1"; CONV_FAIL=$((CONV_FAIL+1)); }
 
 log() { echo "  $1"; }
 
