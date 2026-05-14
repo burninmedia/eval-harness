@@ -1,0 +1,13 @@
+# Hermetic test environment for eval-harness.
+# Pinned Node 20 + build tools so native modules (better-sqlite3, etc.)
+# install and run regardless of host Node version. Built once per harness run
+# by run-eval.sh and reused for the install / unit-test / coverage checks.
+FROM node:20-bookworm-slim
+
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+      python3 make g++ ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+CMD ["bash"]

@@ -1,20 +1,89 @@
 #!/usr/bin/env bash
-# Generate eval report (JSON + Markdown)
+# Generate eval report (JSON + Markdown).
+# Each check writes both an exit code (.exit) and a sub-score (.score, e.g. "5/7")
+# via run_check in run-eval-container.sh. We aggregate both:
+#   - Binary score: count of checks that exited 0  (X / 7)
+#   - Aggregate sub-score: sum of all passed sub-tests / sum of all sub-tests
+#
+# Both are surfaced in the report so a 14/15 contract failure isn't equivalent
+# to a 0/15 catastrophe.
 
 set -euo pipefail
 
 cd "$APP_ROOT"
 
-# Scores (read from check outputs)
-SCORE_TESTS=0; [[ -f "$RESULTS_DIR/check-01-tests.log" ]] && grep -q "PASS" "$RESULTS_DIR/check-01-tests.log" && SCORE_TESTS=1
-SCORE_COVERAGE=0; [[ -f "$RESULTS_DIR/check-02-coverage.log" ]] && grep -q "PASS" "$RESULTS_DIR/check-02-coverage.log" && SCORE_COVERAGE=1
-SCORE_CONVENTIONS=0; [[ -f "$RESULTS_DIR/check-03-conventions.log" ]] && grep -q "passed" "$RESULTS_DIR/check-03-conventions.log" && SCORE_CONVENTIONS=1
-SCORE_SECURITY=0; [[ -f "$RESULTS_DIR/check-04-security.log" ]] && grep -q "PASS\|no critical" "$RESULTS_DIR/check-04-security.log" && SCORE_SECURITY=1
-SCORE_FUNCTIONAL=0; [[ -f "$RESULTS_DIR/check-05-functional.log" ]] && grep -q "PASS" "$RESULTS_DIR/check-05-functional.log" && SCORE_FUNCTIONAL=1
+# Read sub-score "N/M" from a .score file; default to "0/1".
+read_score() {
+  local f="$RESULTS_DIR/check-$1.score"
+  if [[ -f "$f" ]]; then
+    cat "$f"
+  else
+    echo "0/1"
+  fi
+}
 
-TOTAL_PASS=$((SCORE_TESTS + SCORE_COVERAGE + SCORE_CONVENTIONS + SCORE_SECURITY + SCORE_FUNCTIONAL))
-TOTAL_MAX=5
+# Pull the numerator (passed count) from "N/M".
+score_num() { echo "${1%%/*}"; }
+# Pull the denominator (total count) from "N/M".
+score_den() { echo "${1##*/}"; }
+
+# Binary pass/fail per check: did it exit 0?
+read_pass() {
+  local f="$RESULTS_DIR/check-$1.exit"
+  if [[ -f "$f" ]] && [[ "$(cat "$f")" == "0" ]]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# Per-check binary scores
+PASS_TESTS=$(read_pass "01-tests")
+PASS_COVERAGE=$(read_pass "02-coverage")
+PASS_CONVENTIONS=$(read_pass "03-conventions")
+PASS_SECURITY=$(read_pass "04-security")
+PASS_PRODUCTION=$(read_pass "05-production")
+PASS_FUNCTIONAL=$(read_pass "06-functional")
+PASS_INTEGRATION=$(read_pass "07-integration")
+
+# Per-check sub-scores
+SUB_TESTS=$(read_score "01-tests")
+SUB_COVERAGE=$(read_score "02-coverage")
+SUB_CONVENTIONS=$(read_score "03-conventions")
+SUB_SECURITY=$(read_score "04-security")
+SUB_PRODUCTION=$(read_score "05-production")
+SUB_FUNCTIONAL=$(read_score "06-functional")
+SUB_INTEGRATION=$(read_score "07-integration")
+
+# Aggregate binary
+TOTAL_PASS=$((PASS_TESTS + PASS_COVERAGE + PASS_CONVENTIONS + PASS_SECURITY + PASS_PRODUCTION + PASS_FUNCTIONAL + PASS_INTEGRATION))
+TOTAL_MAX=7
 SCORE_PCT=$((TOTAL_PASS * 100 / TOTAL_MAX))
+
+# Aggregate sub-score (sum of N / sum of M across all checks)
+SUB_NUM=0
+SUB_DEN=0
+for s in "$SUB_TESTS" "$SUB_COVERAGE" "$SUB_CONVENTIONS" "$SUB_SECURITY" "$SUB_PRODUCTION" "$SUB_FUNCTIONAL" "$SUB_INTEGRATION"; do
+  SUB_NUM=$((SUB_NUM + $(score_num "$s")))
+  SUB_DEN=$((SUB_DEN + $(score_den "$s")))
+done
+if [[ $SUB_DEN -gt 0 ]]; then
+  SUB_PCT=$((SUB_NUM * 100 / SUB_DEN))
+else
+  SUB_PCT=0
+fi
+
+# Result label for a binary score (with WARN special case for security)
+result_label() {
+  local pass="$1" warn_on_fail="${2:-0}"
+  if [[ "$pass" == "1" ]]; then
+    echo "PASS"
+  elif [[ "$warn_on_fail" == "1" ]]; then
+    echo "WARN"
+  else
+    echo "FAIL"
+  fi
+}
 
 # App info
 APP_NAME=$(node -p "require('./package.json').name" 2>/dev/null || echo "unknown")
@@ -27,7 +96,7 @@ EVAL_DATE=$(date -Iseconds)
 # Markdown Report
 # =============================================================================
 
-cat > "$REPORT_MD" << EOF
+cat >"$REPORT_MD" <<EOF
 # Agent Coding Eval Report
 
 **App:** $APP_NAME
@@ -40,61 +109,71 @@ cat > "$REPORT_MD" << EOF
 
 ## Summary
 
-| Check | Score | Result |
-|-------|-------|--------|
-| Unit Tests | 1/1 | $([ $SCORE_TESTS -eq 1 ] && echo "PASS" || echo "FAIL") |
-| Coverage >= 80% | 1/1 | $([ $SCORE_COVERAGE -eq 1 ] && echo "PASS" || echo "FAIL") |
-| Scaffold Conventions | 1/1 | $([ $SCORE_CONVENTIONS -eq 1 ] && echo "PASS" || echo "FAIL") |
-| Security Scan | 1/1 | $([ $SCORE_SECURITY -eq 1 ] && echo "PASS" || echo "WARN") |
-| Functional (Docker) | 1/1 | $([ $SCORE_FUNCTIONAL -eq 1 ] && echo "PASS" || echo "FAIL") |
+| # | Check | Sub-score | Result |
+|---|-------|-----------|--------|
+| 1 | Unit Tests          | $SUB_TESTS         | $(result_label "$PASS_TESTS") |
+| 2 | Coverage >= 80%     | $SUB_COVERAGE      | $(result_label "$PASS_COVERAGE") |
+| 3 | Scaffold Conventions| $SUB_CONVENTIONS   | $(result_label "$PASS_CONVENTIONS") |
+| 4 | Security Scan       | $SUB_SECURITY      | $(result_label "$PASS_SECURITY" 1) |
+| 5 | Production readiness| $SUB_PRODUCTION    | $(result_label "$PASS_PRODUCTION") |
+| 6 | Functional contract | $SUB_FUNCTIONAL    | $(result_label "$PASS_FUNCTIONAL") |
+| 7 | Integration tests   | $SUB_INTEGRATION   | $(result_label "$PASS_INTEGRATION") |
 
-**Overall: $TOTAL_PASS/$TOTAL_MAX ($SCORE_PCT%)**
+**Binary score: $TOTAL_PASS/$TOTAL_MAX checks passed ($SCORE_PCT%)**
+**Aggregate sub-score: $SUB_NUM/$SUB_DEN sub-tests passed ($SUB_PCT%)**
 
 ---
 
 ## Details
 
-### 1. Unit Tests
-$(cat "$RESULTS_DIR/check-01-tests.log" 2>/dev/null | tail -20 || echo "No output")
+### 1. Unit Tests ($SUB_TESTS)
+$(tail -20 "$RESULTS_DIR/check-01-tests.log" 2>/dev/null || echo "No output")
 
-### 2. Coverage
+### 2. Coverage ($SUB_COVERAGE)
 $(cat "$RESULTS_DIR/coverage-metrics.txt" 2>/dev/null || echo "No coverage data")
 
-### 3. Conventions
-$(cat "$RESULTS_DIR/check-03-conventions.log" 2>/dev/null | tail -30 || echo "No output")
+### 3. Conventions ($SUB_CONVENTIONS)
+$(tail -30 "$RESULTS_DIR/check-03-conventions.log" 2>/dev/null || echo "No output")
 
-### 4. Security
-$(cat "$RESULTS_DIR/npm-audit.txt" 2>/dev/null | grep -E "critical|high|PASS|found" | head -20 || echo "No output")
+### 4. Security ($SUB_SECURITY)
+$(grep -E "critical|high|PASS|found|vulnerabilit" "$RESULTS_DIR/npm-audit.txt" 2>/dev/null | head -20 || echo "No output")
 
-### 5. Functional
-$(cat "$RESULTS_DIR/functional-log.txt" 2>/dev/null | tail -30 || echo "No output")
+### 5. Production ($SUB_PRODUCTION)
+$(tail -35 "$RESULTS_DIR/check-05-production.log" 2>/dev/null || echo "No output")
+
+### 6. Functional contract ($SUB_FUNCTIONAL)
+$(tail -50 "$RESULTS_DIR/check-06-functional.log" 2>/dev/null || echo "No output")
+
+### 7. Integration tests ($SUB_INTEGRATION)
+$(tail -20 "$RESULTS_DIR/check-07-integration.log" 2>/dev/null || echo "No output")
 
 ---
 
-_Generated by eval-harness on $EVAL_DATE_
+_Generated by eval-harness on ${EVAL_DATE}_
 EOF
 
 # =============================================================================
 # JSON Report
 # =============================================================================
 
-cat > "$REPORT_JSON" << EOF
+cat >"$REPORT_JSON" <<EOF
 {
   "app": "$APP_NAME",
   "version": "$APP_VERSION",
   "branch": "$BRANCH",
   "commit": "$COMMIT",
   "evalDate": "$EVAL_DATE",
-  "scores": {
-    "tests": $SCORE_TESTS,
-    "coverage": $SCORE_COVERAGE,
-    "conventions": $SCORE_CONVENTIONS,
-    "security": $SCORE_SECURITY,
-    "functional": $SCORE_FUNCTIONAL
+  "checks": {
+    "tests":        { "pass": $PASS_TESTS,        "subscore": "$SUB_TESTS" },
+    "coverage":     { "pass": $PASS_COVERAGE,     "subscore": "$SUB_COVERAGE" },
+    "conventions":  { "pass": $PASS_CONVENTIONS,  "subscore": "$SUB_CONVENTIONS" },
+    "security":     { "pass": $PASS_SECURITY,     "subscore": "$SUB_SECURITY" },
+    "production":   { "pass": $PASS_PRODUCTION,   "subscore": "$SUB_PRODUCTION" },
+    "functional":   { "pass": $PASS_FUNCTIONAL,   "subscore": "$SUB_FUNCTIONAL" },
+    "integration":  { "pass": $PASS_INTEGRATION,  "subscore": "$SUB_INTEGRATION" }
   },
-  "total": $TOTAL_PASS,
-  "max": $TOTAL_MAX,
-  "percent": $SCORE_PCT,
+  "binary":    { "pass": $TOTAL_PASS, "max": $TOTAL_MAX, "percent": $SCORE_PCT },
+  "aggregate": { "pass": $SUB_NUM,    "max": $SUB_DEN,   "percent": $SUB_PCT },
   "resultsDir": "$RESULTS_DIR"
 }
 EOF

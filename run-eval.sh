@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # =============================================================================
-# eval-harness — Agent Coding Eval Runner
+# eval-harness — host launcher
 # =============================================================================
-# Usage: ./run-eval.sh /path/to/app-root
+# Snapshots the scaffold to /tmp, builds the harness Docker image, and runs
+# the in-container entrypoint against the snapshot. The scaffold on the host
+# is never mutated; the only thing written back to the host is the new
+# `<scaffold>/.eval-results/<timestamp>/` directory.
 #
-# Drops into any cloned app repo and runs the full eval suite:
-#   1. Validates app has required Docker/K8s files
-#   2. Spins up stack with docker-compose
-#   3. Runs: tests, coverage, conventions, security, functional
-#   4. Generates JSON + MD report
-#   5. Tears down stack
+# Usage:
+#   ./run-eval.sh /path/to/scaffold
+#   ./run-eval.sh .                       # current directory
 #
-# Requirements: Docker, docker-compose, bash 4+
+# Requirements (host): Docker only. Bash, jq, node, npm etc. live in the image.
 # =============================================================================
 
 set -euo pipefail
@@ -21,143 +21,112 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-BOLD='\033[1m'
 RESET='\033[0m'
 
-# Paths
-HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_ROOT="${1:-.}"
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR="$APP_ROOT/.eval-results/$TIMESTAMP"
-REPORT_JSON="$RESULTS_DIR/report.json"
-REPORT_MD="$RESULTS_DIR/report.md"
-
-# Scores (updated by each check)
-SCORE_TESTS=0
-SCORE_COVERAGE=0
-SCORE_CONVENTIONS=0
-SCORE_SECURITY=0
-SCORE_FUNCTIONAL=0
-
-export HARNESS_DIR APP_ROOT RESULTS_DIR
-
-# =============================================================================
-# Helpers
-# =============================================================================
-
-log() { echo -e "${BLUE}[HARNESS]${RESET} $*"; }
-pass() { echo -e "${GREEN}[PASS]${RESET} $*"; }
+log()  { echo -e "${BLUE}[LAUNCHER]${RESET} $*"; }
+pass() { echo -e "${GREEN}[OK]${RESET} $*"; }
 fail() { echo -e "${RED}[FAIL]${RESET} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
-info() { echo -e "${BOLD}[INFO]${RESET} $*"; }
 
-run_check() {
-  local name="$1"
-  local script="$2"
-  log "Running: $name"
-  if bash "$script" >> "$RESULTS_DIR/check-$name.log" 2>&1; then
-    pass "$name passed"
-    return 0
-  else
-    fail "$name failed — see $RESULTS_DIR/check-$name.log"
-    return 1
-  fi
+HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# -----------------------------------------------------------------------------
+# Validate args / host environment
+# -----------------------------------------------------------------------------
+APP_INPUT="${1:-.}"
+if [[ ! -d "$APP_INPUT" ]]; then
+  fail "Scaffold path not found: $APP_INPUT"
+  exit 1
+fi
+APP_ROOT_HOST="$(cd "$APP_INPUT" && pwd)"
+
+if [[ ! -f "$APP_ROOT_HOST/package.json" ]]; then
+  fail "No package.json in $APP_ROOT_HOST"
+  exit 1
+fi
+
+if ! command -v docker &>/dev/null; then
+  fail "docker not found on PATH — install Docker Desktop or the engine"
+  exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Snapshot the scaffold to /tmp (immutable from the harness's perspective)
+# -----------------------------------------------------------------------------
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+WORK_DIR="/tmp/eval-harness-$TIMESTAMP"
+RESULTS_HOST="$APP_ROOT_HOST/.eval-results/$TIMESTAMP"
+
+log "Scaffold:  $APP_ROOT_HOST"
+log "Snapshot:  $WORK_DIR"
+log "Results:   $RESULTS_HOST"
+
+mkdir -p "$WORK_DIR"
+
+# rsync if available (faster, easier to exclude); cp -R as fallback.
+if command -v rsync &>/dev/null; then
+  rsync -a \
+    --exclude='node_modules' \
+    --exclude='.eval-results' \
+    --exclude='.git' \
+    "$APP_ROOT_HOST/" "$WORK_DIR/"
+else
+  cp -R "$APP_ROOT_HOST/." "$WORK_DIR/"
+  rm -rf "$WORK_DIR/node_modules" "$WORK_DIR/.eval-results" "$WORK_DIR/.git"
+fi
+
+cleanup() {
+  log "Cleaning up snapshot..."
+  rm -rf "$WORK_DIR" || true
 }
+trap cleanup EXIT
 
-# =============================================================================
-# Main
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Build the harness image (cached after first run)
+# -----------------------------------------------------------------------------
+log "Building harness image (eval-harness:latest)... (first run takes ~60s; cached after)"
+BUILD_LOG="$(mktemp)"
+if ! docker build -t eval-harness:latest "$HARNESS_DIR" >"$BUILD_LOG" 2>&1; then
+  fail "Failed to build harness image — output:"
+  cat "$BUILD_LOG"
+  rm -f "$BUILD_LOG"
+  exit 1
+fi
+rm -f "$BUILD_LOG"
+pass "Harness image ready"
 
-main() {
-  echo ""
-  log "${BOLD}Agent Coding Eval Harness${RESET}"
-  log "App root: $APP_ROOT"
-  log "Results:  $RESULTS_DIR"
-  echo ""
+# -----------------------------------------------------------------------------
+# Run the in-container entrypoint
+# -----------------------------------------------------------------------------
+# - Mount the docker socket so the harness can drive the host daemon
+# - Mount the snapshot at the SAME path inside and outside the container so
+#   any `docker run -v ...` / `docker compose` calls the harness makes resolve
+#   correctly through the host daemon.
+log "Running harness inside container..."
 
-  # Validate app root
-  if [[ ! -f "$APP_ROOT/package.json" ]]; then
-    fail "No package.json found in $APP_ROOT"
-    exit 1
-  fi
+set +e
+docker run --rm \
+  --add-host=host.docker.internal:host-gateway \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$WORK_DIR:$WORK_DIR" \
+  -e EVAL_SKIP_INSTALL="${EVAL_SKIP_INSTALL:-0}" \
+  -e APP_PORT="${APP_PORT:-3000}" \
+  -e APP_HOST="host.docker.internal" \
+  -e HARNESS_TIMESTAMP="$TIMESTAMP" \
+  eval-harness:latest "$WORK_DIR"
+EVAL_EXIT=$?
+set -e
 
-  # Create results dir
-  mkdir -p "$RESULTS_DIR"
+# -----------------------------------------------------------------------------
+# Copy results back to the host scaffold
+# -----------------------------------------------------------------------------
+SNAPSHOT_RESULTS="$WORK_DIR/.eval-results"
+if [[ -d "$SNAPSHOT_RESULTS" ]]; then
+  mkdir -p "$APP_ROOT_HOST/.eval-results"
+  cp -R "$SNAPSHOT_RESULTS/." "$APP_ROOT_HOST/.eval-results/"
+  pass "Results copied to $APP_ROOT_HOST/.eval-results/"
+else
+  warn "No results directory produced inside container"
+fi
 
-  # Header
-  echo ""
-  echo "============================================"
-  echo "  AGENT CODING EVAL — $TIMESTAMP"
-  echo "============================================"
-  echo ""
-
-  # Check 0: Prerequisites
-  log "Checking prerequisites..."
-  for cmd in docker docker-compose node npm; do
-    if ! command -v $cmd &>/dev/null; then
-      fail "$cmd not found — install required tools"
-      exit 1
-    fi
-  done
-  pass "All prerequisites found"
-
-  # Check 1: App Validation (Dockerfile + docker-compose exist)
-  log "Checking app Docker readiness..."
-  if [[ -f "$APP_ROOT/Dockerfile" ]]; then
-    pass "Dockerfile found"
-    echo "PASS" > "$RESULTS_DIR/check-dockerfile.txt"
-  else
-    warn "No Dockerfile — one will be generated"
-    echo "GENERATED" > "$RESULTS_DIR/check-dockerfile.txt"
-  fi
-
-  if [[ -f "$APP_ROOT/docker-compose.yml" ]] || [[ -f "$APP_ROOT/docker-compose.yaml" ]]; then
-    pass "docker-compose found"
-    echo "PASS" > "$RESULTS_DIR/check-compose.txt"
-  else
-    warn "No docker-compose — one will be generated"
-    echo "GENERATED" > "$RESULTS_DIR/check-compose.txt"
-  fi
-
-  # Check 2: Tests
-  echo ""
-  log "=== Check 1: Unit Tests ==="
-  run_check "01-tests" "$HARNESS_DIR/checks/01-tests.sh" && SCORE_TESTS=1 || SCORE_TESTS=0
-
-  # Check 3: Coverage
-  echo ""
-  log "=== Check 2: Coverage >= 80% ==="
-  run_check "02-coverage" "$HARNESS_DIR/checks/02-coverage.sh" && SCORE_COVERAGE=1 || SCORE_COVERAGE=0
-
-  # Check 4: Conventions
-  echo ""
-  log "=== Check 3: Scaffold Conventions ==="
-  run_check "03-conventions" "$HARNESS_DIR/checks/03-conventions.sh" && SCORE_CONVENTIONS=1 || SCORE_CONVENTIONS=0
-
-  # Check 5: Security
-  echo ""
-  log "=== Check 4: Security Scan ==="
-  run_check "04-security" "$HARNESS_DIR/checks/04-security.sh" && SCORE_SECURITY=1 || SCORE_SECURITY=0
-
-  # Check 6: Functional (Docker spin-up + smoke test)
-  echo ""
-  log "=== Check 5: Functional (Docker stack + smoke test) ==="
-  run_check "05-functional" "$HARNESS_DIR/checks/05-functional.sh" && SCORE_FUNCTIONAL=1 || SCORE_FUNCTIONAL=0
-
-  # Generate report
-  echo ""
-  log "Generating report..."
-  bash "$HARNESS_DIR/report/generate.sh"
-
-  echo ""
-  echo "============================================"
-  echo "  EVAL COMPLETE"
-  echo "============================================"
-  echo ""
-  cat "$REPORT_MD"
-  echo ""
-  log "Full results: $RESULTS_DIR"
-  log "JSON report:  $REPORT_JSON"
-}
-
-main "$@"
+exit "$EVAL_EXIT"

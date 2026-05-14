@@ -1,0 +1,6 @@
+.git
+.github
+.eval-results
+node_modules
+*.md
+README.md

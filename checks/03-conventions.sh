@@ -20,84 +20,132 @@ check_fail() { echo "[FAIL] $1"; CONV_FAIL=$((CONV_FAIL+1)); }
 
 log() { echo "  $1"; }
 
+# Count lines from a grep without tripping pipefail when grep finds nothing.
+# Usage: count=$(grep_count -rE "pattern" path ...)
+grep_count() {
+  local n
+  n=$(grep "$@" 2>/dev/null | wc -l || echo 0)
+  echo "${n:-0}" | tr -d '[:space:]'
+}
+
 echo "Checking scaffold conventions..."
 
-# 1. DAL — all SQL queries in src/dal/
+# 1. DAL — all DB access in src/dal/
 log "DAL separation check..."
-SQL_IN_DAL=$(grep -r "db.prepare\|db.query\|db.exec\|SELECT\|INSERT\|UPDATE\|DELETE" "$APP_ROOT/src/dal/" 2>/dev/null | wc -l || 0)
-SQL_OUTSIDE_DAL=$(grep -rn "db.prepare\|db.query\|db.exec\|SELECT\|INSERT\|UPDATE\|DELETE" "$APP_ROOT/src/routes/" "$APP_ROOT/src/services/" 2>/dev/null | grep -v "dal\|DAL" | wc -l || 0)
+# Anchor on actual sqlite/better-sqlite3 / pg call sites instead of bare SQL keywords
+# (bare keywords match comments, log strings, identifiers, and produce noise).
+DAL_DIR="$APP_ROOT/src/dal"
+# DB call sites — match the methods directly (covers chained calls like
+# getDb().prepare(), db.prepare(), database.exec(), pool.query()).
+# .prepare( and .transaction( are DB-specific enough to be reliable signals.
+DB_CALL_RE='(\.(prepare|transaction|exec)[[:space:]]*\(|new[[:space:]]+Database[[:space:]]*\(|require\(['"'"'\"]better-sqlite3['"'"'\"]\))'
+SQL_IN_DAL=0
+SQL_OUTSIDE_DAL=0
+if [[ -d "$DAL_DIR" ]]; then
+  SQL_IN_DAL=$(grep_count -rE "$DB_CALL_RE" "$DAL_DIR")
+fi
+for dir in "$APP_ROOT/src/routes" "$APP_ROOT/src/services" "$APP_ROOT/src/controllers"; do
+  if [[ -d "$dir" ]]; then
+    n=$(grep_count -rE "$DB_CALL_RE" "$dir")
+    SQL_OUTSIDE_DAL=$((SQL_OUTSIDE_DAL + n))
+  fi
+done
 if [[ $SQL_OUTSIDE_DAL -eq 0 ]] && [[ $SQL_IN_DAL -gt 0 ]]; then
-  check_pass "All DB access in src/dal/ ($SQL_IN_DAL queries found)"
+  check_pass "All DB access in src/dal/ ($SQL_IN_DAL call sites)"
 elif [[ $SQL_OUTSIDE_DAL -gt 0 ]]; then
-  check_fail "Raw SQL found outside src/dal/ ($SQL_OUTSIDE_DAL occurrences)"
-  grep -rn "db.prepare\|db.query\|SELECT\|INSERT\|UPDATE\|DELETE" "$APP_ROOT/src/routes/" "$APP_ROOT/src/services/" 2>/dev/null | grep -v "dal\|DAL" | head -5
+  check_fail "DB calls found outside src/dal/ ($SQL_OUTSIDE_DAL occurrences)"
+  for dir in "$APP_ROOT/src/routes" "$APP_ROOT/src/services" "$APP_ROOT/src/controllers"; do
+    [[ -d "$dir" ]] && grep -rnE "$DB_CALL_RE" "$dir" 2>/dev/null | head -5 || true
+  done
 else
-  check_fail "No SQL found in src/dal/ — DAL may not be implemented"
+  check_fail "No DB call sites found in src/dal/ — DAL may not be implemented"
 fi
 
 # 2. Error envelope format — { error, code } in responses
 log "Error envelope check..."
-ERROR_ENVELOPE=$(grep -r "error.*code\|\.error\s*=" "$APP_ROOT/src/" 2>/dev/null | grep -v "errorEnvelope\|\.error =" | wc -l || 0)
-WRONG_ERROR=$(grep -rn 'res\.json.*message:\|res\.json.*msg:\|res\.json.*"message"\|res\.json.*{ msg' "$APP_ROOT/src/routes/" 2>/dev/null | wc -l || 0)
+ERROR_ENVELOPE=$(grep_count -rE "error['\"]?[[:space:]]*[:,].*code|code['\"]?[[:space:]]*:" "$APP_ROOT/src")
+WRONG_ERROR=$(grep_count -rnE 'res\.json\([^)]*(message|msg)[[:space:]]*:' "$APP_ROOT/src/routes")
 if [[ $WRONG_ERROR -eq 0 ]] && [[ $ERROR_ENVELOPE -gt 0 ]]; then
-  check_pass "Error envelope format used correctly"
+  check_pass "Error envelope format used (no { message: ... } payloads in routes)"
 elif [[ $WRONG_ERROR -gt 0 ]]; then
-  check_fail "Non-standard error format found (should be { error, code })"
+  check_fail "Non-standard error format found ($WRONG_ERROR uses of message/msg in route json)"
 else
-  check_fail "No error handling found"
+  check_fail "No error envelope ({ error, code }) found in src/"
 fi
 
-# 3. Naming conventions — kebab-case files, camelCase functions
+# 3. Naming conventions — kebab-case files (excluding tests + config files)
 log "Naming conventions check..."
-NON_KEBAB=$(find "$APP_ROOT/src" -name "*.js" 2>/dev/null | xargs -I{} basename {} | grep -v "^-" | grep -E "[A-Z]|_" | head -5 || true)
+ALLOW_RE='^(jest\.config|jest\.setup|babel\.config|eslint\.config|tailwind\.config|vite\.config|webpack\.config)\.(js|cjs|mjs|ts)$'
+NON_KEBAB=$(
+  find "$APP_ROOT/src" -type f -name "*.js" \
+    -not -path "*/__tests__/*" \
+    -not -name "*.test.js" \
+    -not -name "*.spec.js" \
+    2>/dev/null \
+  | while read -r f; do
+      b=$(basename "$f")
+      [[ "$b" =~ $ALLOW_RE ]] && continue
+      # Flag if filename has uppercase or underscores
+      if echo "$b" | grep -qE "[A-Z_]"; then
+        echo "$b"
+      fi
+    done | head -5 || true
+)
 if [[ -z "$NON_KEBAB" ]]; then
   check_pass "Files use kebab-case"
 else
-  check_fail "Non-kebab-case files found: $NON_KEBAB"
+  check_fail "Non-kebab-case files: $(echo "$NON_KEBAB" | tr '\n' ' ')"
 fi
 
-# 4. Graceful shutdown — SIGTERM handler
+# 4. Graceful shutdown — SIGTERM/SIGINT handler in entry point
 log "Graceful shutdown check..."
-if grep -rq "SIGTERM\|SIGINT\|shutdown" "$APP_ROOT/src/index.js" 2>/dev/null; then
-  check_pass "Graceful shutdown implemented"
+ENTRY=""
+for cand in "$APP_ROOT/src/index.js" "$APP_ROOT/src/server.js" "$APP_ROOT/src/app.js"; do
+  [[ -f "$cand" ]] && ENTRY="$cand" && break
+done
+if [[ -n "$ENTRY" ]] && grep -qE "SIGTERM|SIGINT|gracefulShutdown" "$ENTRY"; then
+  check_pass "Graceful shutdown implemented in $(basename "$ENTRY")"
 else
-  check_fail "No SIGTERM/SIGINT shutdown handler found"
+  check_fail "No SIGTERM/SIGINT shutdown handler found in src/{index,server,app}.js"
 fi
 
 # 5. Auth guards — requireAuth middleware on protected routes
 log "Auth guards check..."
-PROTECTED_ROUTES=$(grep -r "router\.\(get\|post\|put\|delete\|patch\)" "$APP_ROOT/src/routes/" 2>/dev/null | wc -l || 0)
-AUTH_GUARDS=$(grep -r "requireAuth\|require-auth\|isAuthenticated" "$APP_ROOT/src/routes/" 2>/dev/null | wc -l || 0)
-if [[ $AUTH_GUARDS -ge 3 ]]; then  # At least a few routes have auth
-  check_pass "Auth guards found on protected routes"
+AUTH_GUARDS=0
+if [[ -d "$APP_ROOT/src/routes" ]]; then
+  AUTH_GUARDS=$(grep_count -rE "requireAuth|isAuthenticated|ensureAuth" "$APP_ROOT/src/routes")
+fi
+if [[ $AUTH_GUARDS -ge 3 ]]; then
+  check_pass "Auth guards found on protected routes ($AUTH_GUARDS references)"
 else
-  check_fail "Auth guards may be missing (found $AUTH_GUARDS uses of requireAuth)"
+  check_fail "Auth guards may be missing (found $AUTH_GUARDS uses of requireAuth/isAuthenticated/ensureAuth)"
 fi
 
 # 6. Secrets — no hardcoded values
 log "Secrets check (no hardcoded credentials)..."
-HARDCODED=$(grep -rn "password\s*=\s*['\"][^$][^'\"]*['\"]\|api_key\s*=\s*['\"][^$][^'\"]*['\"]\|secret\s*=\s*['\"][^$][^'\"]*['\"]" "$APP_ROOT/src/" 2>/dev/null | grep -v "\.env\|\.example\|process\.env" | head -5 || true)
+HARDCODED=$(
+  grep -rnE "(password|api_key|secret)[[:space:]]*=[[:space:]]*['\"][^'\"$][^'\"]*['\"]" \
+    "$APP_ROOT/src" 2>/dev/null \
+  | grep -vE "process\.env|\.env|\.example" \
+  | head -5 || true
+)
 if [[ -z "$HARDCODED" ]]; then
   check_pass "No obvious hardcoded secrets found"
 else
-  check_fail "Possible hardcoded secrets found: $HARDCODED"
+  check_fail "Possible hardcoded secrets:"
+  echo "$HARDCODED"
 fi
 
-# 7. Business logic in services
-log "Business logic separation check..."
-ROUTE_WITH_LOGIC=$(grep -rn "if.*==\|for.*\|while\|SELECT\|INSERT" "$APP_ROOT/src/routes/" 2>/dev/null | grep -v "require\|import\|throw\|return" | wc -l || 0)
-if [[ $ROUTE_WITH_LOGIC -lt 3 ]]; then
-  check_pass "Route handlers mostly thin (business logic in services)"
-else
-  check_fail "Route handlers may contain business logic ($ROUTE_WITH_LOGIC logic statements found)"
+# 7. Business logic in services — heuristic: route files shouldn't import the DAL directly
+log "Thin route handlers check..."
+ROUTES_USING_DAL=0
+if [[ -d "$APP_ROOT/src/routes" ]]; then
+  ROUTES_USING_DAL=$(grep_count -rE "require\(['\"].*dal['\"]\)|from[[:space:]]+['\"].*dal['\"]" "$APP_ROOT/src/routes")
 fi
-
-# 8. SESSION.md handoff template present
-log "SESSION.md check..."
-if [[ -f "$APP_ROOT/SESSION.md" ]]; then
-  check_pass "SESSION.md handoff template present"
+if [[ $ROUTES_USING_DAL -eq 0 ]]; then
+  check_pass "Routes don't import DAL directly (thin handlers)"
 else
-  check_fail "SESSION.md not found — no session handoff template"
+  check_fail "Route files import DAL directly in $ROUTES_USING_DAL place(s) — push to services"
 fi
 
 # Summary
